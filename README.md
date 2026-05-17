@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Emmix
 
 Emmix is an experimental, browser-first WASI runtime written in Rust. The goal
@@ -170,3 +171,6 @@ developer runtimes.
 3. Build the TypeScript framework API.
 4. Run a WASI shell/tooling proof of concept.
 5. Add snapshots, package resolution, and terminal integration.
+=======
+# emmix
+>>>>>>> f455033f4329a3d91e7795f39a144aafa9efd51a

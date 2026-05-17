@@ -1,0 +1,9 @@
+{
+  "type": "module",
+  "scripts": {
+    "serve": "node web/serve.mjs",
+    "smoke": "node js/smoke/runner.mjs",
+    "fixture:rust": "node js/smoke/rust-fixture.mjs",
+    "process:smoke": "node js/smoke/process.mjs"
+  }
+}

@@ -189,6 +189,55 @@ impl VirtualFileSystem {
         }
     }
 
+    pub(crate) fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), String> {
+        let old_parts = Self::components(old_path)?;
+        let new_parts = Self::components(new_path)?;
+
+        if old_parts.is_empty() || new_parts.is_empty() {
+            return Err("cannot rename root".to_string());
+        }
+
+        if old_parts == new_parts {
+            return Ok(());
+        }
+
+        if new_parts.starts_with(&old_parts) {
+            return Err("cannot move an entry into itself".to_string());
+        }
+
+        if Self::node_at(&self.root, &old_parts).is_none() {
+            return Err("source does not exist".to_string());
+        }
+
+        if Self::node_at(&self.root, &new_parts).is_some() {
+            return Err("destination already exists".to_string());
+        }
+
+        let (new_name, new_parent_parts) = new_parts
+            .split_last()
+            .ok_or_else(|| "cannot rename root".to_string())?;
+
+        match Self::node_at(&self.root, new_parent_parts) {
+            Some(VfsNode::Directory(_)) => {}
+            Some(VfsNode::File(_)) => {
+                return Err("destination parent is not a directory".to_string())
+            }
+            None => return Err("destination parent does not exist".to_string()),
+        }
+
+        let node = Self::remove_node(&mut self.root, &old_parts)?;
+        let new_parent = Self::node_at_mut(&mut self.root, new_parent_parts)
+            .ok_or_else(|| "destination parent does not exist".to_string())?;
+
+        match new_parent {
+            VfsNode::Directory(children) => {
+                children.insert((*new_name).to_string(), node);
+                Ok(())
+            }
+            VfsNode::File(_) => Err("destination parent is not a directory".to_string()),
+        }
+    }
+
     pub(crate) fn write_file(
         &mut self,
         path: &str,
@@ -298,6 +347,22 @@ impl VirtualFileSystem {
             VfsNode::File(_) => None,
         }
     }
+
+    fn remove_node(node: &mut VfsNode, parts: &[&str]) -> Result<VfsNode, String> {
+        let (name, parent_parts) = parts
+            .split_last()
+            .ok_or_else(|| "cannot remove root".to_string())?;
+
+        let parent = Self::node_at_mut(node, parent_parts)
+            .ok_or_else(|| "parent directory does not exist".to_string())?;
+
+        match parent {
+            VfsNode::Directory(children) => children
+                .remove(*name)
+                .ok_or_else(|| "entry does not exist".to_string()),
+            VfsNode::File(_) => Err("parent is not a directory".to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -376,5 +441,51 @@ mod tests {
 
         assert_eq!(fs.entry_size("/tmp").unwrap(), 0);
         assert_eq!(fs.entry_size("/tmp/file.txt").unwrap(), 5);
+    }
+
+    #[test]
+    fn rename_moves_files_and_directories() {
+        let mut fs = VirtualFileSystem::new();
+
+        fs.create_directory("/tmp").unwrap();
+        fs.create_directory("/tmp/archive").unwrap();
+        fs.create_file("/tmp/file.txt").unwrap();
+        fs.write_file("/tmp/file.txt", 0, b"hello").unwrap();
+
+        fs.rename("/tmp/file.txt", "/tmp/archive/final.txt")
+            .unwrap();
+
+        assert_eq!(fs.kind("/tmp/file.txt").unwrap(), None);
+        assert_eq!(
+            fs.kind("/tmp/archive/final.txt").unwrap(),
+            Some(VfsEntryKind::File)
+        );
+
+        let mut contents = [0; 5];
+        assert_eq!(
+            fs.read_file("/tmp/archive/final.txt", 0, &mut contents)
+                .unwrap(),
+            5
+        );
+        assert_eq!(&contents, b"hello");
+
+        fs.rename("/tmp/archive", "/renamed").unwrap();
+        assert_eq!(fs.kind("/tmp/archive").unwrap(), None);
+        assert_eq!(fs.kind("/renamed").unwrap(), Some(VfsEntryKind::Directory));
+    }
+
+    #[test]
+    fn rename_rejects_missing_destination_parent_existing_destination_and_self_move() {
+        let mut fs = VirtualFileSystem::new();
+
+        fs.create_directory("/tmp").unwrap();
+        fs.create_directory("/tmp/child").unwrap();
+        fs.create_file("/tmp/file.txt").unwrap();
+        fs.create_file("/tmp/existing.txt").unwrap();
+
+        assert!(fs.rename("/tmp/missing.txt", "/tmp/new.txt").is_err());
+        assert!(fs.rename("/tmp/file.txt", "/missing/new.txt").is_err());
+        assert!(fs.rename("/tmp/file.txt", "/tmp/existing.txt").is_err());
+        assert!(fs.rename("/tmp", "/tmp/child/moved").is_err());
     }
 }

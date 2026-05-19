@@ -13,25 +13,28 @@ export class EmmixProcessExit extends Error {
 
 export class EmmixRunner {
   constructor(options = {}) {
+    this.runtime = new EmmixRuntime(0);
+    this.workspace = new EmmixWorkspace(() => this.runtime);
+    this.instance = undefined;
+    this.module = undefined;
+    this.memory = undefined;
+    this.stdoutChunks = [];
+    this.stderrChunks = [];
+    this.onStdout = undefined;
+    this.onStderr = undefined;
+    this.configure(options);
+  }
+
+  configure(options = {}) {
     const {
       args = DEFAULT_ARGS,
       environ = DEFAULT_ENVIRON,
       stdin,
     } = options;
 
-    this.runtime = new EmmixRuntime(0);
     this.runtime.set_args(args);
     this.runtime.set_environ(environ);
-
-    if (stdin !== undefined) {
-      this.runtime.feed_stdin(toUint8Array(stdin));
-    }
-
-    this.instance = undefined;
-    this.module = undefined;
-    this.memory = undefined;
-    this.stdoutChunks = [];
-    this.stderrChunks = [];
+    this.runtime.set_stdin(stdin === undefined ? new Uint8Array() : toUint8Array(stdin));
     this.onStdout = typeof options.onStdout === "function" ? options.onStdout : undefined;
     this.onStderr = typeof options.onStderr === "function" ? options.onStderr : undefined;
   }
@@ -63,7 +66,15 @@ export class EmmixRunner {
     return instance;
   }
 
-  async run(moduleInput, extraImports = {}) {
+  async run(moduleInput, extraImports = {}, options) {
+    if (options !== undefined) {
+      this.configure(options);
+    }
+
+    this.stdoutChunks = [];
+    this.stderrChunks = [];
+    this.runtime.take_missing_syscalls();
+
     const instance = await this.instantiate(moduleInput, extraImports);
     const start = instance.exports._start;
 
@@ -90,6 +101,7 @@ export class EmmixRunner {
       exitCode,
       stdout: concatUint8Arrays(this.stdoutChunks),
       stderr: concatUint8Arrays(this.stderrChunks),
+      missingSyscalls: this.runtime.take_missing_syscalls(),
       instance: this.instance,
       runtime: this.runtime,
     };
@@ -122,6 +134,7 @@ export class EmmixRunner {
       environ_sizes_get: (countPtr, bufSizePtr) =>
         this.call((runtime) => runtime.environ_sizes_get(countPtr, bufSizePtr)),
       fd_close: (fd) => this.call((runtime) => runtime.fd_close(fd)),
+      fd_datasync: (fd) => this.call((runtime) => runtime.fd_datasync(fd)),
       fd_fdstat_get: (fd, statPtr) =>
         this.call((runtime) => runtime.fd_fdstat_get(fd, statPtr)),
       fd_filestat_get: (fd, statPtr) =>
@@ -136,8 +149,13 @@ export class EmmixRunner {
         this.call((runtime) =>
           runtime.fd_readdir(fd, bufPtr, bufLen, cookie, bufusedPtr),
         ),
+      fd_renumber: (fd, to) =>
+        this.call((runtime) => runtime.fd_renumber(fd, to)),
       fd_seek: (fd, offset, whence, newoffsetPtr) =>
         this.call((runtime) => runtime.fd_seek(fd, offset, whence, newoffsetPtr)),
+      fd_sync: (fd) => this.call((runtime) => runtime.fd_sync(fd)),
+      fd_tell: (fd, offsetPtr) =>
+        this.call((runtime) => runtime.fd_tell(fd, offsetPtr)),
       fd_write: (fd, iovsPtr, iovsLen, nwrittenPtr) => {
         const errno = this.call((runtime) =>
           runtime.fd_write(fd, iovsPtr, iovsLen, nwrittenPtr),
@@ -181,6 +199,35 @@ export class EmmixRunner {
         this.call((runtime) =>
           runtime.path_remove_directory(dirfd, pathPtr, pathLen),
         ),
+      path_readlink: (dirfd, pathPtr, pathLen, bufPtr, bufLen, bufusedPtr) =>
+        this.call((runtime) =>
+          runtime.path_readlink(
+            dirfd,
+            pathPtr,
+            pathLen,
+            bufPtr,
+            bufLen,
+            bufusedPtr,
+          ),
+        ),
+      path_rename: (
+        oldFd,
+        oldPathPtr,
+        oldPathLen,
+        newFd,
+        newPathPtr,
+        newPathLen,
+      ) =>
+        this.call((runtime) =>
+          runtime.path_rename(
+            oldFd,
+            oldPathPtr,
+            oldPathLen,
+            newFd,
+            newPathPtr,
+            newPathLen,
+          ),
+        ),
       path_unlink_file: (dirfd, pathPtr, pathLen) =>
         this.call((runtime) => runtime.path_unlink_file(dirfd, pathPtr, pathLen)),
       proc_exit: (code) => {
@@ -197,6 +244,61 @@ export class EmmixRunner {
 
   call(callback) {
     return callback(this.runtime);
+  }
+}
+
+export class EmmixWorkspace {
+  constructor(runtime) {
+    this.runtime = runtime;
+  }
+
+  readFile(path) {
+    return this.runtime().workspace_read_file(path);
+  }
+
+  readText(path) {
+    return new TextDecoder().decode(this.readFile(path));
+  }
+
+  writeFile(path, contents) {
+    this.runtime().workspace_write_file(path, toUint8Array(contents));
+  }
+
+  writeText(path, contents) {
+    this.writeFile(path, contents);
+  }
+
+  readDir(path = "/") {
+    return this.runtime().workspace_read_dir(path);
+  }
+
+  mkdir(path) {
+    this.runtime().workspace_create_directory(path);
+  }
+
+  removeFile(path) {
+    this.runtime().workspace_remove_file(path);
+  }
+
+  removeDirectory(path) {
+    this.runtime().workspace_remove_directory(path);
+  }
+
+  rename(oldPath, newPath) {
+    this.runtime().workspace_rename(oldPath, newPath);
+  }
+
+  stat(path) {
+    const type = this.runtime().workspace_entry_type(path);
+
+    if (type === undefined || type === null) {
+      return undefined;
+    }
+
+    return {
+      type,
+      size: Number(this.runtime().workspace_entry_size(path)),
+    };
   }
 }
 

@@ -57,22 +57,44 @@ const term = new Terminal({
 
 const fitAddon = new FitAddon();
 term.loadAddon(fitAddon);
-term.open(document.getElementById('terminal-wrap'));
+
+const termWrap = document.getElementById('terminal-wrap');
+term.open(termWrap);
+
+// ── Overflow fix ──────────────────────────────────────────────────────────────
+// xterm's height:100% positions it from the top padding edge, so it overflows
+// the bottom padding. Inject a corrected height to match the content area.
+{
+  const cs = getComputedStyle(termWrap);
+  const vPad = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+  if (vPad > 0) {
+    const s = document.createElement('style');
+    s.textContent = `#terminal-wrap .xterm { height: calc(100% - ${vPad}px) !important; }`;
+    document.head.appendChild(s);
+  }
+}
+
 fitAddon.fit();
-window.addEventListener('resize', () => fitAddon.fit());
+
+// ResizeObserver is more reliable than window.resize (catches toolbar/zoom changes)
+if (typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(() => fitAddon.fit()).observe(termWrap);
+} else {
+  window.addEventListener('resize', () => fitAddon.fit());
+}
 
 // ── Write helpers ─────────────────────────────────────────────────────────────
 
+function nl2crnl(text) {
+  return text.replace(/\r?\n/g, '\r\n');
+}
+
 function write(text) {
-  term.write(text.replace(/(?<!\r)\n/g, '\r\n'));
+  term.write(nl2crnl(text));
 }
 
 function writeln(text = '') {
   write(text + '\n');
-}
-
-function nl2crnl(text) {
-  return text.replace(/\r?\n/g, '\r\n');
 }
 
 // ── Application state ─────────────────────────────────────────────────────────
@@ -85,6 +107,7 @@ const state = {
   stdin:     '',
   running:   false,
   cancelRequested: false,
+  cwd:       '/',
 };
 
 // ── DOM helpers ───────────────────────────────────────────────────────────────
@@ -106,24 +129,60 @@ function setWasmName(name) {
   wasmBadge.className = 'wasm-badge' + (name ? ' loaded' : '');
 }
 
-// ── Dynamic import of runner (graceful failure if pkg/ not built) ─────────────
+// ── Dynamic import of runner and vfs ─────────────────────────────────────────
 
-let process = null;
+let process    = null;
+let vfsRunner  = null;
 
 async function loadRunner() {
   try {
-    // Absolute path - process.js lives at /js/process.js relative to emmix root
-    const mod = await import('/js/process.js');
-    process = new mod.EmmixProcess();
+    const [procMod, runnerMod] = await Promise.all([
+      import('/js/process.js'),
+      import('/js/runner.js'),
+    ]);
+    process   = new procMod.EmmixProcess();
+    vfsRunner = await runnerMod.createEmmixRunner();
+
+    // Bridge EmmixWorkspace to the vfs* API used by terminal commands
+    vfsRunner.vfsLs = (path) => {
+      const names = vfsRunner.workspace.readDir(path);
+      return names.map(name => {
+        const fullPath = (path === '/' ? '' : path) + '/' + name;
+        const info = vfsRunner.workspace.stat(fullPath);
+        return { name, kind: info?.type ?? 'file' };
+      });
+    };
+    vfsRunner.vfsMkdir     = (path)          => vfsRunner.workspace.mkdir(path);
+    vfsRunner.vfsWriteFile = (path, content) => vfsRunner.workspace.writeFile(path, content);
+    vfsRunner.vfsReadFile  = (path)          => vfsRunner.workspace.readFile(path);
+    vfsRunner.vfsUnlink    = (path)          => vfsRunner.workspace.removeFile(path);
+    vfsRunner.vfsRmdir     = (path)          => vfsRunner.workspace.removeDirectory(path);
+
     return true;
   } catch {
     return false;
   }
 }
 
+// ── Path helpers ──────────────────────────────────────────────────────────────
+
+function resolvePath(path, cwd) {
+  const base = path.startsWith('/') ? path : cwd.replace(/\/?$/, '/') + path;
+  const parts = base.split('/').filter(Boolean);
+  const resolved = [];
+  for (const p of parts) {
+    if (p === '..') resolved.pop();
+    else if (p !== '.') resolved.push(p);
+  }
+  return '/' + resolved.join('/');
+}
+
 // ── LineEditor: readline-style single-line input ──────────────────────────────
 
-const PROMPT = `${A.bGreen}emmix${A.reset}${A.bold}>${A.reset} `;
+function getPrompt() {
+  const dir = state.cwd === '/' ? '/' : state.cwd.split('/').pop();
+  return `${A.bGreen}emmix${A.reset}${A.dim}:${A.reset}${A.bBlue}${dir}${A.reset}${A.bold}>${A.reset} `;
+}
 
 class LineEditor {
   constructor() {
@@ -137,7 +196,7 @@ class LineEditor {
   }
 
   prompt() {
-    write(PROMPT);
+    write(getPrompt());
     return new Promise((res, rej) => { this._res = res; this._rej = rej; });
   }
 
@@ -265,7 +324,7 @@ class LineEditor {
   // Redraw the whole prompt line
   _redrawLine() {
     term.write('\r\x1b[2K');
-    write(PROMPT + this.line);
+    write(getPrompt() + this.line);
     const back = this.line.length - this.cursor;
     if (back > 0) term.write(`\x1b[${back}D`);
   }
@@ -371,7 +430,7 @@ COMMANDS.help = function() {
   writeln();
   writeln(`${A.bold}${A.bCyan}Emmix Browser Terminal${A.reset}  ${A.dim}· browser-first WASI runtime · wasm32-wasip1${A.reset}`);
   writeln();
-  writeln(`${A.bold}Commands${A.reset}`);
+  writeln(`${A.bold}WASM commands${A.reset}`);
   writeln(`  ${A.bGreen}run${A.reset} ${A.dim}[arg ...]${A.reset}        Run the loaded WASM module`);
   writeln(`  ${A.bGreen}kill${A.reset}                  Cancel the running module`);
   writeln(`  ${A.bGreen}upload${A.reset}               Open file picker to load a .wasm file`);
@@ -382,21 +441,28 @@ COMMANDS.help = function() {
   writeln(`  ${A.bGreen}env${A.reset} ${A.dim}[K=V ...]${A.reset}        Set environment variables (print current if empty)`);
   writeln(`  ${A.bGreen}info${A.reset}                 Show current configuration`);
   writeln(`  ${A.bGreen}reset${A.reset}                Reset args, env, and stdin to defaults`);
+  writeln();
+  writeln(`${A.bold}Filesystem commands${A.reset}  ${A.dim}(live Rust VFS — persists between commands)${A.reset}`);
+  writeln(`  ${A.bGreen}ls${A.reset} ${A.dim}[path]${A.reset}            List directory contents`);
+  writeln(`  ${A.bGreen}cd${A.reset} ${A.dim}<path>${A.reset}            Change working directory`);
+  writeln(`  ${A.bGreen}pwd${A.reset}                  Print working directory`);
+  writeln(`  ${A.bGreen}mkdir${A.reset} ${A.dim}<path>${A.reset}         Create directory (parents must exist)`);
+  writeln(`  ${A.bGreen}touch${A.reset} ${A.dim}<path>${A.reset}         Create empty file`);
+  writeln(`  ${A.bGreen}write${A.reset} ${A.dim}<path> <text>${A.reset}  Write text to file (overwrites)`);
+  writeln(`  ${A.bGreen}cat${A.reset} ${A.dim}<path>${A.reset}           Print file contents`);
+  writeln(`  ${A.bGreen}rm${A.reset} ${A.dim}<path>${A.reset}            Remove file`);
+  writeln(`  ${A.bGreen}rmdir${A.reset} ${A.dim}<path>${A.reset}         Remove empty directory`);
+  writeln();
+  writeln(`${A.bold}Other${A.reset}`);
   writeln(`  ${A.bGreen}clear${A.reset}                Clear the terminal`);
   writeln(`  ${A.bGreen}help${A.reset}                 Show this message`);
   writeln();
   writeln(`${A.bold}Keyboard shortcuts${A.reset}`);
   writeln(`  ${A.bYellow}↑ / ↓${A.reset}     Command history`);
-  writeln(`  ${A.bYellow}Ctrl+C${A.reset}    Cancel input`);
-  writeln(`  ${A.bYellow}Ctrl+C${A.reset}    Cancel a running module`);
+  writeln(`  ${A.bYellow}Ctrl+C${A.reset}    Cancel input / cancel running module`);
   writeln(`  ${A.bYellow}Ctrl+L${A.reset}    Clear screen`);
   writeln(`  ${A.bYellow}Ctrl+W${A.reset}    Delete word`);
   writeln(`  ${A.bYellow}Ctrl+D${A.reset}    End multiline stdin input`);
-  writeln();
-  writeln(`${A.bold}Tips${A.reset}`);
-  writeln(`  Drag and drop a ${A.bBlue}.wasm${A.reset} file onto the window to load it instantly.`);
-  writeln(`  Compile: ${A.dim}rustc --target wasm32-wasip1 hello.rs -o hello.wasm${A.reset}`);
-  writeln(`  Or:      ${A.dim}cargo build --target wasm32-wasip1 --release${A.reset}`);
   writeln();
 };
 
@@ -415,6 +481,7 @@ COMMANDS.info = function() {
     ? `${JSON.stringify(state.stdin.slice(0, 80))}${state.stdin.length > 80 ? '…' : ''} (${state.stdin.length} bytes)`
     : `${A.dim}(empty)${A.reset}`;
   writeln(`  ${A.cyan}stdin${A.reset}    ${stdinPreview}`);
+  writeln(`  ${A.cyan}cwd${A.reset}      ${A.dim}${state.cwd}${A.reset}`);
   writeln();
 };
 
@@ -535,14 +602,14 @@ COMMANDS.run = async function(rest) {
       onStdout(chunk) {
         streamedStdout += chunk.byteLength;
         const text = stdoutDecoder.decode(chunk, { stream: true });
-        if (text) write(nl2crnl(text));
+        if (text) write(text);
       },
       onStderr(chunk) {
         streamedStderr += chunk.byteLength;
         const text = stderrDecoder.decode(chunk, { stream: true });
         if (text) {
           write(A.red);
-          write(nl2crnl(text));
+          write(text);
           write(A.reset);
         }
       },
@@ -560,25 +627,25 @@ COMMANDS.run = async function(rest) {
 
   const elapsed = ((performance.now() - t0) / 1000).toFixed(3);
   const stdoutTail = stdoutDecoder.decode();
-  if (stdoutTail) write(nl2crnl(stdoutTail));
+  if (stdoutTail) write(stdoutTail);
 
   const stderrTail = stderrDecoder.decode();
   if (stderrTail) {
     write(A.red);
-    write(nl2crnl(stderrTail));
+    write(stderrTail);
     write(A.reset);
   }
 
   if (streamedStdout === 0 && result.stdout.byteLength > 0) {
     const stdout = new TextDecoder().decode(result.stdout);
-    write(nl2crnl(stdout));
+    write(stdout);
     if (!stdout.endsWith('\n')) writeln();
   }
 
   if (streamedStderr === 0 && result.stderr.byteLength > 0) {
     const stderr = new TextDecoder().decode(result.stderr);
     write(A.red);
-    write(nl2crnl(stderr));
+    write(stderr);
     write(A.reset);
     if (!stderr.endsWith('\n')) writeln();
   }
@@ -591,6 +658,131 @@ COMMANDS.run = async function(rest) {
   state.running = false;
   state.cancelRequested = false;
   setStatus(exitOk ? 'ready' : 'error', exitOk ? 'ready' : 'error');
+};
+
+// ── Filesystem commands ───────────────────────────────────────────────────────
+
+function requireVfs() {
+  if (!vfsRunner) {
+    writeln(`${A.bRed}✗${A.reset} VFS not available (runtime not loaded)`);
+    return false;
+  }
+  return true;
+}
+
+COMMANDS.ls = function(rest) {
+  if (!requireVfs()) return;
+  const path = rest.trim() ? resolvePath(rest.trim(), state.cwd) : state.cwd;
+  try {
+    const entries = vfsRunner.vfsLs(path);
+    if (!entries.length) { writeln(`${A.dim}(empty)${A.reset}`); return; }
+    for (const e of entries) {
+      writeln(e.kind === 'directory'
+        ? `${A.bBlue}${e.name}/${A.reset}`
+        : e.name);
+    }
+  } catch (e) {
+    writeln(`${A.bRed}ls: ${e.message}${A.reset}`);
+  }
+};
+
+COMMANDS.cd = function(rest) {
+  if (!requireVfs()) return;
+  const target = rest.trim() || '/';
+  const abs = resolvePath(target, state.cwd);
+  try {
+    vfsRunner.vfsLs(abs);  // verifies the path is an accessible directory
+    state.cwd = abs;
+    editor._redrawLine();  // refresh prompt to show new dir
+  } catch (e) {
+    writeln(`${A.bRed}cd: ${e.message}${A.reset}`);
+  }
+};
+
+COMMANDS.pwd = function() {
+  writeln(state.cwd);
+};
+
+COMMANDS.mkdir = function(rest) {
+  if (!requireVfs()) return;
+  const path = rest.trim();
+  if (!path) { writeln(`${A.bRed}✗${A.reset} Usage: mkdir <path>`); return; }
+  const abs = resolvePath(path, state.cwd);
+  try {
+    vfsRunner.vfsMkdir(abs);
+    writeln(`${A.bGreen}✓${A.reset} created ${A.bBlue}${abs}/${A.reset}`);
+  } catch (e) {
+    writeln(`${A.bRed}mkdir: ${e.message}${A.reset}`);
+  }
+};
+
+COMMANDS.touch = function(rest) {
+  if (!requireVfs()) return;
+  const path = rest.trim();
+  if (!path) { writeln(`${A.bRed}✗${A.reset} Usage: touch <path>`); return; }
+  const abs = resolvePath(path, state.cwd);
+  try {
+    vfsRunner.vfsWriteFile(abs, new Uint8Array(0));
+    writeln(`${A.bGreen}✓${A.reset} ${abs}`);
+  } catch (e) {
+    writeln(`${A.bRed}touch: ${e.message}${A.reset}`);
+  }
+};
+
+COMMANDS.write = function(rest) {
+  if (!requireVfs()) return;
+  const spaceIdx = rest.search(/\s/);
+  if (spaceIdx === -1) { writeln(`${A.bRed}✗${A.reset} Usage: write <path> <text>`); return; }
+  const pathArg = rest.slice(0, spaceIdx);
+  const content = rest.slice(spaceIdx + 1);
+  const abs = resolvePath(pathArg, state.cwd);
+  try {
+    vfsRunner.vfsWriteFile(abs, content);
+    writeln(`${A.bGreen}✓${A.reset} wrote ${content.length} bytes to ${abs}`);
+  } catch (e) {
+    writeln(`${A.bRed}write: ${e.message}${A.reset}`);
+  }
+};
+
+COMMANDS.cat = function(rest) {
+  if (!requireVfs()) return;
+  const path = rest.trim();
+  if (!path) { writeln(`${A.bRed}✗${A.reset} Usage: cat <path>`); return; }
+  const abs = resolvePath(path, state.cwd);
+  try {
+    const bytes = vfsRunner.vfsReadFile(abs);
+    const text = new TextDecoder().decode(bytes);
+    write(text);
+    if (text.length > 0 && !text.endsWith('\n')) writeln();
+  } catch (e) {
+    writeln(`${A.bRed}cat: ${e.message}${A.reset}`);
+  }
+};
+
+COMMANDS.rm = function(rest) {
+  if (!requireVfs()) return;
+  const path = rest.trim();
+  if (!path) { writeln(`${A.bRed}✗${A.reset} Usage: rm <path>`); return; }
+  const abs = resolvePath(path, state.cwd);
+  try {
+    vfsRunner.vfsUnlink(abs);
+    writeln(`${A.bGreen}✓${A.reset} removed ${abs}`);
+  } catch (e) {
+    writeln(`${A.bRed}rm: ${e.message}${A.reset}`);
+  }
+};
+
+COMMANDS.rmdir = function(rest) {
+  if (!requireVfs()) return;
+  const path = rest.trim();
+  if (!path) { writeln(`${A.bRed}✗${A.reset} Usage: rmdir <path>`); return; }
+  const abs = resolvePath(path, state.cwd);
+  try {
+    vfsRunner.vfsRmdir(abs);
+    writeln(`${A.bGreen}✓${A.reset} removed ${abs}/`);
+  } catch (e) {
+    writeln(`${A.bRed}rmdir: ${e.message}${A.reset}`);
+  }
 };
 
 // ── Utilities ─────────────────────────────────────────────────────────────────

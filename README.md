@@ -22,11 +22,12 @@ The repository currently contains the Rust runtime core:
 - `js/process.js`: browser `Worker` process wrapper for running modules off
   the UI thread.
 - `js/process-worker.js`: shared worker entry used by the browser and Node
-  smoke test.
+  smoke test; keeps one runtime session alive across sequential runs.
 - `js/smoke/runner.mjs`: a Node smoke test that builds a tiny WASI-style
   module and runs it through the runner.
 - `js/smoke/rust-fixture.mjs`: compiles `fixtures/hello.rs` to `wasm32-wasip1`
-  and runs it through Emmix.
+  and runs it through Emmix, including larger file writes, rename, unlink, and
+  directory removal.
 - `js/smoke/process.mjs`: tests the worker process wrapper, streaming output,
   cancellation, worker restart, and the Rust fixture.
 
@@ -36,10 +37,13 @@ Implemented syscall pieces include:
 - `fd_read`
 - `fd_readdir`
 - `fd_seek`
+- `fd_tell`
 - `fd_fdstat_get`
 - `fd_prestat_get`
 - `fd_prestat_dir_name`
 - `fd_close`
+- `fd_sync`
+- `fd_datasync`
 - `args_sizes_get`
 - `args_get`
 - `environ_sizes_get`
@@ -49,6 +53,7 @@ Implemented syscall pieces include:
 - `path_open`
 - `path_create_directory`
 - `path_filestat_get`
+- `path_rename`
 - `path_unlink_file`
 - `path_remove_directory`
 - `proc_exit`
@@ -64,8 +69,12 @@ Current VFS/runtime support includes:
 - a `wasm-bindgen` `EmmixRuntime` wrapper
 - direct guest `WebAssembly.Memory` access for the JavaScript runner
 - worker-backed process execution for the browser test terminal
+- persistent worker runtime sessions, so VFS/runtime state can survive
+  sequential runs in the same process wrapper
 - process cancellation by terminating/restarting the worker
 - stdout/stderr streaming callbacks from worker-backed runs
+- missing syscall reporting through `missingSyscalls` on JS runner/process
+  results
 
 The experimental runner in `js/runner.js` can instantiate a `wasm32-wasi`
 module, provide a `wasi_snapshot_preview1` import object, call `_start`, and
@@ -104,7 +113,6 @@ npm.cmd run serve
 Next targets:
 
 - Add more metadata/mutation syscalls as larger real WASI programs request them.
-- Expand the Rust fixture into rename/remove and larger directory/file cases.
 - Build the TypeScript framework API.
 
 ## Build
@@ -164,9 +172,8 @@ developer runtimes.
 
 ## Roadmap
 
-1. Expand the Rust fixture into rename/remove and larger directory/file cases.
-2. Add missing common WASI syscalls as those fixture cases or real binaries
+1. Add missing common WASI syscalls as fixture cases or real binaries
    request them.
-3. Build the TypeScript framework API.
-4. Run a WASI shell/tooling proof of concept.
-5. Add snapshots, package resolution, and terminal integration.
+2. Build the TypeScript framework API.
+3. Run a WASI shell/tooling proof of concept.
+4. Add snapshots, package resolution, and terminal integration.

@@ -40,6 +40,10 @@ impl EmmixRuntime {
         self.inner.feed_stdin(data);
     }
 
+    pub fn set_stdin(&mut self, data: &[u8]) {
+        self.inner.set_stdin(data);
+    }
+
     pub fn take_stdout(&mut self) -> Vec<u8> {
         self.inner.take_stdout()
     }
@@ -76,6 +80,69 @@ impl EmmixRuntime {
             .map_err(|message| JsValue::from_str(&message))
     }
 
+    pub fn missing_syscalls(&self) -> Box<[JsValue]> {
+        strings_to_js_values(self.inner.missing_syscalls())
+    }
+
+    pub fn take_missing_syscalls(&mut self) -> Box<[JsValue]> {
+        strings_to_js_values(self.inner.take_missing_syscalls())
+    }
+
+    pub fn workspace_read_file(&self, path: &str) -> Result<Vec<u8>, JsValue> {
+        self.inner
+            .workspace_read_file(path)
+            .map_err(|message| JsValue::from_str(&message))
+    }
+
+    pub fn workspace_write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), JsValue> {
+        self.inner
+            .workspace_write_file(path, bytes)
+            .map_err(|message| JsValue::from_str(&message))
+    }
+
+    pub fn workspace_read_dir(&self, path: &str) -> Result<Box<[JsValue]>, JsValue> {
+        self.inner
+            .workspace_read_dir(path)
+            .map(strings_to_js_values)
+            .map_err(|message| JsValue::from_str(&message))
+    }
+
+    pub fn workspace_create_directory(&mut self, path: &str) -> Result<(), JsValue> {
+        self.inner
+            .workspace_create_directory(path)
+            .map_err(|message| JsValue::from_str(&message))
+    }
+
+    pub fn workspace_remove_file(&mut self, path: &str) -> Result<(), JsValue> {
+        self.inner
+            .workspace_remove_file(path)
+            .map_err(|message| JsValue::from_str(&message))
+    }
+
+    pub fn workspace_remove_directory(&mut self, path: &str) -> Result<(), JsValue> {
+        self.inner
+            .workspace_remove_directory(path)
+            .map_err(|message| JsValue::from_str(&message))
+    }
+
+    pub fn workspace_rename(&mut self, old_path: &str, new_path: &str) -> Result<(), JsValue> {
+        self.inner
+            .workspace_rename(old_path, new_path)
+            .map_err(|message| JsValue::from_str(&message))
+    }
+
+    pub fn workspace_entry_type(&self, path: &str) -> Result<Option<String>, JsValue> {
+        self.inner
+            .workspace_entry_type(path)
+            .map_err(|message| JsValue::from_str(&message))
+    }
+
+    pub fn workspace_entry_size(&self, path: &str) -> Result<u64, JsValue> {
+        self.inner
+            .workspace_entry_size(path)
+            .map_err(|message| JsValue::from_str(&message))
+    }
+
     #[cfg(target_arch = "wasm32")]
     pub fn attach_guest_memory(&mut self, memory: js_sys::WebAssembly::Memory) {
         self.inner.attach_guest_memory(memory);
@@ -103,6 +170,10 @@ impl EmmixRuntime {
 
     pub fn fd_seek(&mut self, fd: u32, offset: i64, whence: u32, newoffset_ptr: u32) -> u32 {
         self.inner.fd_seek(fd, offset, whence, newoffset_ptr)
+    }
+
+    pub fn fd_tell(&mut self, fd: u32, offset_ptr: u32) -> u32 {
+        self.inner.fd_tell(fd, offset_ptr)
     }
 
     pub fn fd_fdstat_get(&mut self, fd: u32, stat_ptr: u32) -> u32 {
@@ -135,6 +206,18 @@ impl EmmixRuntime {
 
     pub fn fd_close(&mut self, fd: u32) -> u32 {
         self.inner.fd_close(fd)
+    }
+
+    pub fn fd_renumber(&mut self, fd: u32, to: u32) -> u32 {
+        self.inner.fd_renumber(fd, to)
+    }
+
+    pub fn fd_sync(&mut self, fd: u32) -> u32 {
+        self.inner.fd_sync(fd)
+    }
+
+    pub fn fd_datasync(&mut self, fd: u32) -> u32 {
+        self.inner.fd_datasync(fd)
     }
 
     pub fn args_sizes_get(&mut self, argc_ptr: u32, argv_buf_size_ptr: u32) -> u32 {
@@ -190,6 +273,38 @@ impl EmmixRuntime {
         self.inner.path_create_directory(dirfd, path_ptr, path_len)
     }
 
+    pub fn path_rename(
+        &mut self,
+        old_fd: u32,
+        old_path_ptr: u32,
+        old_path_len: u32,
+        new_fd: u32,
+        new_path_ptr: u32,
+        new_path_len: u32,
+    ) -> u32 {
+        self.inner.path_rename(
+            old_fd,
+            old_path_ptr,
+            old_path_len,
+            new_fd,
+            new_path_ptr,
+            new_path_len,
+        )
+    }
+
+    pub fn path_readlink(
+        &mut self,
+        dirfd: u32,
+        path_ptr: u32,
+        path_len: u32,
+        buf_ptr: u32,
+        buf_len: u32,
+        bufused_ptr: u32,
+    ) -> u32 {
+        self.inner
+            .path_readlink(dirfd, path_ptr, path_len, buf_ptr, buf_len, bufused_ptr)
+    }
+
     pub fn path_unlink_file(&mut self, dirfd: u32, path_ptr: u32, path_len: u32) -> u32 {
         self.inner.path_unlink_file(dirfd, path_ptr, path_len)
     }
@@ -202,7 +317,7 @@ impl EmmixRuntime {
         self.inner.proc_exit(code);
     }
 
-    pub fn stub(&self, name: &str) -> u32 {
+    pub fn stub(&mut self, name: &str) -> u32 {
         self.inner.stub(name)
     }
 }
@@ -220,4 +335,12 @@ fn js_values_to_strings(values: Box<[JsValue]>) -> Result<Vec<String>, JsValue> 
                 .ok_or_else(|| JsValue::from_str("expected an array of strings"))
         })
         .collect()
+}
+
+fn strings_to_js_values(values: Vec<String>) -> Box<[JsValue]> {
+    values
+        .into_iter()
+        .map(|value| JsValue::from_str(&value))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
 }

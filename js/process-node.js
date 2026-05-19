@@ -3,9 +3,12 @@ import { Worker } from "node:worker_threads";
 export class EmmixProcess {
   constructor(options = {}) {
     this.workerUrl = options.workerUrl ?? new URL("./process-worker.js", import.meta.url);
+    this.runtimeWasm = options.runtimeWasm;
+    this.workspace = new EmmixProcessWorkspace(this);
 
     this.nextId = 1;
     this.pending = new Map();
+    this.processes = new Map();
     this.worker = undefined;
     this.startWorker();
   }
@@ -22,16 +25,35 @@ export class EmmixProcess {
   }
 
   run(wasmBytes, options = {}) {
+    return this.spawn(wasmBytes, options).result;
+  }
+
+  exec(wasmBytes, options = {}) {
+    return this.run(wasmBytes, options);
+  }
+
+  spawn(wasmBytes, options = {}) {
     const id = this.nextId++;
     const bytes = toOwnedUint8Array(wasmBytes);
+    const active = [...this.processes.values()].filter((process) =>
+      process.status === "running",
+    );
 
-    return new Promise((resolve, reject) => {
+    if (active.length > 0) {
+      throw new Error("process already running");
+    }
+
+    const process = new EmmixProcessHandle(this, id, options);
+    this.processes.set(id, process);
+
+    process.result = new Promise((resolve, reject) => {
       this.pending.set(id, {
+        kind: "run",
+        process,
         resolve,
         reject,
-        onStdout: options.onStdout,
-        onStderr: options.onStderr,
       });
+      process.status = "running";
       this.worker.postMessage(
         {
           id,
@@ -40,27 +62,51 @@ export class EmmixProcess {
           args: options.args,
           environ: options.environ,
           stdin: options.stdin,
-          runtimeWasm: options.runtimeWasm,
+          runtimeWasm: options.runtimeWasm ?? this.runtimeWasm,
         },
         [bytes.buffer],
+      );
+    });
+
+    return process;
+  }
+
+  sendWorkspace(operation, payload = {}, transfer = []) {
+    const id = this.nextId++;
+
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { kind: "workspace", resolve, reject });
+      this.worker.postMessage(
+        {
+          id,
+          type: "workspace",
+          operation,
+          runtimeWasm: this.runtimeWasm,
+          ...payload,
+        },
+        transfer,
       );
     });
   }
 
   terminate() {
     this.worker.terminate();
-    for (const { reject } of this.pending.values()) {
-      reject(new Error("process worker terminated"));
+    for (const [id, pending] of this.pending.entries()) {
+      const error = new Error("process worker terminated");
+      if (pending.kind === "run") {
+        pending.process.finish("failed", error);
+      }
+      pending.reject(error);
+      this.pending.delete(id);
     }
-    this.pending.clear();
   }
 
   cancel(id) {
-    const cancelled = id === undefined
-      ? [...this.pending.keys()]
-      : this.pending.has(id)
-        ? [id]
-        : [];
+    const cancelled = [...this.pending.entries()]
+      .filter(([pendingId, pending]) =>
+        pending.kind === "run" && (id === undefined || pendingId === id),
+      )
+      .map(([pendingId]) => pendingId);
 
     if (cancelled.length === 0) {
       return false;
@@ -70,16 +116,30 @@ export class EmmixProcess {
 
     for (const pendingId of cancelled) {
       const pending = this.pending.get(pendingId);
-      pending?.reject(new Error("process cancelled"));
+      const error = new Error("process cancelled");
+      pending?.process.finish("cancelled", error);
+      pending?.reject(error);
       this.pending.delete(pendingId);
     }
 
-    for (const pending of this.pending.values()) {
-      pending.reject(new Error("process worker restarted"));
+    for (const [pendingId, pending] of this.pending.entries()) {
+      const error = new Error("process worker restarted");
+      if (pending.kind === "run") {
+        pending.process.finish("failed", error);
+      }
+      pending.reject(error);
+      this.pending.delete(pendingId);
     }
-    this.pending.clear();
     this.startWorker();
     return true;
+  }
+
+  get(id) {
+    return this.processes.get(id);
+  }
+
+  list() {
+    return [...this.processes.values()];
   }
 
   handleMessage(message) {
@@ -91,9 +151,9 @@ export class EmmixProcess {
 
     if (message.type === "output") {
       if (message.stream === "stdout") {
-        pending.onStdout?.(message.chunk);
+        pending.process?.pushStdout(message.chunk);
       } else if (message.stream === "stderr") {
-        pending.onStderr?.(message.chunk);
+        pending.process?.pushStderr(message.chunk);
       }
       return;
     }
@@ -101,23 +161,120 @@ export class EmmixProcess {
     this.pending.delete(message.id);
 
     if (message.type === "result") {
-      pending.resolve({
+      const result = {
+        pid: message.id,
         exitCode: message.exitCode,
         stdout: message.stdout,
         stderr: message.stderr,
-      });
+        missingSyscalls: message.missingSyscalls ?? [],
+      };
+      pending.process?.finish("exited", result);
+      pending.resolve(result);
+      return;
+    }
+
+    if (message.type === "workspaceResult") {
+      pending.resolve(message.value);
       return;
     }
 
     const error = new Error(message.message || "process worker failed");
     error.stack = message.stack || error.stack;
+    pending.process?.finish("failed", error);
     pending.reject(error);
+  }
+}
+
+export class EmmixProcessHandle {
+  constructor(manager, id, options = {}) {
+    this.manager = manager;
+    this.id = id;
+    this.pid = id;
+    this.status = "starting";
+    this.startedAt = Date.now();
+    this.finishedAt = undefined;
+    this.stdoutChunks = [];
+    this.stderrChunks = [];
+    this.onStdout = typeof options.onStdout === "function" ? options.onStdout : undefined;
+    this.onStderr = typeof options.onStderr === "function" ? options.onStderr : undefined;
+    this.result = undefined;
+  }
+
+  pushStdout(chunk) {
+    this.stdoutChunks.push(chunk);
+    this.onStdout?.(chunk);
+  }
+
+  pushStderr(chunk) {
+    this.stderrChunks.push(chunk);
+    this.onStderr?.(chunk);
+  }
+
+  finish(status, outcome) {
+    this.status = status;
+    this.finishedAt = Date.now();
+    this.outcome = outcome;
+  }
+
+  cancel() {
+    return this.manager.cancel(this.id);
+  }
+}
+
+export class EmmixProcessWorkspace {
+  constructor(process) {
+    this.process = process;
+  }
+
+  readFile(path) {
+    return this.process.sendWorkspace("readFile", { path });
+  }
+
+  async readText(path) {
+    return new TextDecoder().decode(await this.readFile(path));
+  }
+
+  writeFile(path, contents) {
+    const bytes = toOwnedUint8Array(contents);
+    return this.process.sendWorkspace("writeFile", { path, bytes }, [bytes.buffer]);
+  }
+
+  writeText(path, contents) {
+    return this.writeFile(path, new TextEncoder().encode(contents));
+  }
+
+  readDir(path = "/") {
+    return this.process.sendWorkspace("readDir", { path });
+  }
+
+  mkdir(path) {
+    return this.process.sendWorkspace("mkdir", { path });
+  }
+
+  removeFile(path) {
+    return this.process.sendWorkspace("removeFile", { path });
+  }
+
+  removeDirectory(path) {
+    return this.process.sendWorkspace("removeDirectory", { path });
+  }
+
+  rename(oldPath, newPath) {
+    return this.process.sendWorkspace("rename", { oldPath, newPath });
+  }
+
+  stat(path) {
+    return this.process.sendWorkspace("stat", { path });
   }
 }
 
 function toOwnedUint8Array(value) {
   if (value instanceof Uint8Array) {
     return new Uint8Array(value);
+  }
+
+  if (typeof value === "string") {
+    return new TextEncoder().encode(value);
   }
 
   if (value instanceof ArrayBuffer) {

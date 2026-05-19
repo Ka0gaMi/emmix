@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use crate::memory::WasmMemory;
 use crate::vfs::{VfsEntryKind, VirtualFileSystem};
@@ -59,7 +59,13 @@ struct IoVec {
 }
 
 #[allow(dead_code)]
-enum Descriptor {
+enum FdEntry {
+    Stdin,
+    Stdout,
+    Stderr,
+    PreopenDirectory {
+        path: String,
+    },
     Directory {
         path: String,
     },
@@ -89,11 +95,10 @@ pub struct WasiRuntime {
     stdin: VecDeque<u8>,
     args: Vec<String>,
     environ: Vec<String>,
-    preopens: Vec<String>,
-    closed_fds: HashSet<u32>,
-    descriptors: std::collections::HashMap<u32, Descriptor>,
+    fd_table: HashMap<u32, FdEntry>,
     next_fd: u32,
     fs: VirtualFileSystem,
+    missing_syscalls: Vec<String>,
 }
 
 impl WasiRuntime {
@@ -102,8 +107,16 @@ impl WasiRuntime {
     // ==============================
 
     pub fn new(memory_size: usize) -> Self {
-        let preopens = vec!["/".to_string()];
-        let next_fd = 3 + preopens.len() as u32;
+        let mut fd_table = HashMap::new();
+        fd_table.insert(0, FdEntry::Stdin);
+        fd_table.insert(1, FdEntry::Stdout);
+        fd_table.insert(2, FdEntry::Stderr);
+        fd_table.insert(
+            3,
+            FdEntry::PreopenDirectory {
+                path: "/".to_string(),
+            },
+        );
 
         Self {
             memory: WasmMemory::new(memory_size),
@@ -112,11 +125,10 @@ impl WasiRuntime {
             stdin: VecDeque::new(),
             args: vec!["sh".to_string()],
             environ: vec!["PATH=/usr/bin:/bin".to_string(), "HOME=/home".to_string()],
-            preopens,
-            closed_fds: HashSet::new(),
-            descriptors: std::collections::HashMap::new(),
-            next_fd,
+            fd_table,
+            next_fd: 4,
             fs: VirtualFileSystem::new(),
+            missing_syscalls: Vec::new(),
         }
     }
 
@@ -124,79 +136,58 @@ impl WasiRuntime {
     // Internal helpers
     // ==============================
 
-    fn preopen_for_fd(&self, fd: u32) -> Option<&String> {
-        if self.closed_fds.contains(&fd) {
-            return None;
-        }
-
-        let preopen_idx = fd.checked_sub(3)? as usize;
-        self.preopens.get(preopen_idx)
-    }
-
-    fn is_stdio_fd(fd: u32) -> bool {
-        matches!(fd, 0 | 1 | 2)
-    }
-
-    fn is_fd_closed(&self, fd: u32) -> bool {
-        self.closed_fds.contains(&fd)
-    }
-
     fn is_open_fd(&self, fd: u32) -> bool {
-        !self.is_fd_closed(fd)
-            && (Self::is_stdio_fd(fd)
-                || self.preopen_for_fd(fd).is_some()
-                || self.descriptors.contains_key(&fd))
+        self.fd_table.contains_key(&fd)
     }
 
-    fn descriptor_file_type(&self, fd: u32) -> Option<FileType> {
-        match self.descriptors.get(&fd)? {
-            Descriptor::Directory { .. } => Some(FileType::Directory),
-            Descriptor::File { .. } => Some(FileType::RegularFile),
+    fn fd_file_type(&self, fd: u32) -> Option<FileType> {
+        match self.fd_table.get(&fd)? {
+            FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => Some(FileType::CharacterDevice),
+            FdEntry::PreopenDirectory { .. } | FdEntry::Directory { .. } => {
+                Some(FileType::Directory)
+            }
+            FdEntry::File { .. } => Some(FileType::RegularFile),
         }
     }
 
-    fn descriptor_dir_path(&self, fd: u32) -> Option<String> {
-        if let Some(path) = self.preopen_for_fd(fd) {
-            return Some(path.clone());
-        }
-
-        match self.descriptors.get(&fd)? {
-            Descriptor::Directory { path } => Some(path.clone()),
-            Descriptor::File { .. } => None,
+    fn fd_dir_path(&self, fd: u32) -> Option<String> {
+        match self.fd_table.get(&fd)? {
+            FdEntry::PreopenDirectory { path } | FdEntry::Directory { path } => Some(path.clone()),
+            FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr | FdEntry::File { .. } => None,
         }
     }
 
-    fn descriptor_file_state(&self, fd: u32) -> Option<(String, usize, bool)> {
-        match self.descriptors.get(&fd)? {
-            Descriptor::File {
+    fn fd_file_state(&self, fd: u32) -> Option<(String, usize, bool)> {
+        match self.fd_table.get(&fd)? {
+            FdEntry::File {
                 path,
                 offset,
                 append,
             } => Some((path.clone(), *offset, *append)),
-            Descriptor::Directory { .. } => None,
+            _ => None,
         }
     }
 
-    fn set_descriptor_file_offset(&mut self, fd: u32, offset: usize) -> Result<(), u32> {
-        match self.descriptors.get_mut(&fd) {
-            Some(Descriptor::File {
+    fn set_fd_file_offset(&mut self, fd: u32, offset: usize) -> Result<(), u32> {
+        match self.fd_table.get_mut(&fd) {
+            Some(FdEntry::File {
                 offset: current_offset,
                 ..
             }) => {
                 *current_offset = offset;
                 Ok(())
             }
-            Some(Descriptor::Directory { .. }) => Err(Errno::Inval as u32),
+            Some(_) => Err(Errno::Inval as u32),
             None => Err(Errno::Badf as u32),
         }
     }
 
-    fn alloc_fd(&mut self, descriptor: Descriptor) -> Result<u32, u32> {
+    fn alloc_fd(&mut self, entry: FdEntry) -> Result<u32, u32> {
         let fd = self.next_fd;
 
         self.next_fd = self.next_fd.checked_add(1).ok_or(Errno::TooBig as u32)?;
 
-        if self.descriptors.insert(fd, descriptor).is_some() {
+        if self.fd_table.insert(fd, entry).is_some() {
             return Err(Errno::Inval as u32);
         }
 
@@ -213,7 +204,7 @@ impl WasiRuntime {
             return Ok(Self::normalize_path("/", &path));
         }
 
-        let base = self.descriptor_dir_path(dirfd).ok_or(Errno::Badf as u32)?;
+        let base = self.fd_dir_path(dirfd).ok_or(Errno::Badf as u32)?;
 
         Ok(Self::normalize_path(&base, &path))
     }
@@ -332,6 +323,12 @@ impl WasiRuntime {
         usize::try_from(next).map_err(|_| Errno::Inval as u32)
     }
 
+    fn record_missing_syscall(&mut self, name: &str) {
+        if !self.missing_syscalls.iter().any(|entry| entry == name) {
+            self.missing_syscalls.push(name.to_string());
+        }
+    }
+
     // ==============================
     // Host-facing helpers
     // ==============================
@@ -346,6 +343,11 @@ impl WasiRuntime {
     }
 
     pub fn feed_stdin(&mut self, data: &[u8]) {
+        self.stdin.extend(data);
+    }
+
+    pub fn set_stdin(&mut self, data: &[u8]) {
+        self.stdin.clear();
         self.stdin.extend(data);
     }
 
@@ -369,6 +371,79 @@ impl WasiRuntime {
         self.memory.write_bytes(ptr, bytes)
     }
 
+    pub fn missing_syscalls(&self) -> Vec<String> {
+        self.missing_syscalls.clone()
+    }
+
+    pub fn take_missing_syscalls(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.missing_syscalls)
+    }
+
+    pub fn workspace_read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+        let path = Self::normalize_path("/", path);
+        let len = self.fs.entry_size(&path)?;
+        let len = usize::try_from(len).map_err(|_| "file is too large".to_string())?;
+        let mut contents = vec![0; len];
+        let bytes_read = self.fs.read_file(&path, 0, &mut contents)?;
+        contents.truncate(bytes_read);
+        Ok(contents)
+    }
+
+    pub fn workspace_write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        let path = Self::normalize_path("/", path);
+
+        match self.fs.kind(&path)? {
+            Some(VfsEntryKind::File) => self.fs.truncate_file(&path)?,
+            Some(VfsEntryKind::Directory) => return Err("path is a directory".to_string()),
+            None => self.fs.create_file(&path)?,
+        }
+
+        self.fs.write_file(&path, 0, bytes)?;
+        Ok(())
+    }
+
+    pub fn workspace_read_dir(&self, path: &str) -> Result<Vec<String>, String> {
+        let path = Self::normalize_path("/", path);
+        let entries = self.fs.read_dir(&path)?;
+
+        Ok(entries.into_iter().map(|entry| entry.name).collect())
+    }
+
+    pub fn workspace_create_directory(&mut self, path: &str) -> Result<(), String> {
+        let path = Self::normalize_path("/", path);
+        self.fs.create_directory(&path)
+    }
+
+    pub fn workspace_remove_file(&mut self, path: &str) -> Result<(), String> {
+        let path = Self::normalize_path("/", path);
+        self.fs.unlink_file(&path)
+    }
+
+    pub fn workspace_remove_directory(&mut self, path: &str) -> Result<(), String> {
+        let path = Self::normalize_path("/", path);
+        self.fs.remove_directory(&path)
+    }
+
+    pub fn workspace_rename(&mut self, old_path: &str, new_path: &str) -> Result<(), String> {
+        let old_path = Self::normalize_path("/", old_path);
+        let new_path = Self::normalize_path("/", new_path);
+        self.fs.rename(&old_path, &new_path)
+    }
+
+    pub fn workspace_entry_type(&self, path: &str) -> Result<Option<String>, String> {
+        let path = Self::normalize_path("/", path);
+
+        Ok(self.fs.kind(&path)?.map(|kind| match kind {
+            VfsEntryKind::Directory => "directory".to_string(),
+            VfsEntryKind::File => "file".to_string(),
+        }))
+    }
+
+    pub fn workspace_entry_size(&self, path: &str) -> Result<u64, String> {
+        let path = Self::normalize_path("/", path);
+        self.fs.entry_size(&path)
+    }
+
     #[cfg(target_arch = "wasm32")]
     pub fn attach_guest_memory(&mut self, memory: js_sys::WebAssembly::Memory) {
         self.memory = WasmMemory::from_guest(memory);
@@ -387,14 +462,14 @@ impl WasiRuntime {
         iovs_len: u32,     // number of iovecs
         nwritten_ptr: u32, // where to write total bytes written
     ) -> u32 {
-        if self.is_fd_closed(fd) {
+        if !self.is_open_fd(fd) {
             return Errno::Badf as u32;
         }
 
         let mut total_written: u32 = 0;
         let mut file_state = match fd {
             1 | 2 => None,
-            _ => match self.descriptor_file_state(fd) {
+            _ => match self.fd_file_state(fd) {
                 Some(state) => Some(state),
                 None => return Errno::Badf as u32,
             },
@@ -464,7 +539,7 @@ impl WasiRuntime {
         }
 
         if let Some((_, offset, _)) = file_state {
-            if let Err(errno) = self.set_descriptor_file_offset(fd, offset) {
+            if let Err(errno) = self.set_fd_file_offset(fd, offset) {
                 return errno;
             }
         }
@@ -479,14 +554,14 @@ impl WasiRuntime {
         iovs_len: u32,  // number of iovecs
         nread_ptr: u32, // where to write total bytes actually read
     ) -> u32 {
-        if self.is_fd_closed(fd) {
+        if !self.is_open_fd(fd) {
             return Errno::Badf as u32;
         }
 
         let mut total_read: u32 = 0;
         let mut file_state = match fd {
             0 => None,
-            _ => match self.descriptor_file_state(fd) {
+            _ => match self.fd_file_state(fd) {
                 Some(state) => Some(state),
                 None => return Errno::Badf as u32,
             },
@@ -590,7 +665,7 @@ impl WasiRuntime {
         }
 
         if let Some((_, offset, _)) = file_state {
-            if let Err(errno) = self.set_descriptor_file_offset(fd, offset) {
+            if let Err(errno) = self.set_fd_file_offset(fd, offset) {
                 return errno;
             }
         }
@@ -606,7 +681,7 @@ impl WasiRuntime {
         cookie: u64,
         bufused_ptr: u32,
     ) -> u32 {
-        let dir_path = match self.descriptor_dir_path(fd) {
+        let dir_path = match self.fd_dir_path(fd) {
             Some(path) => path,
             None => return Errno::Badf as u32,
         };
@@ -694,7 +769,7 @@ impl WasiRuntime {
     }
 
     pub fn fd_seek(&mut self, fd: u32, offset: i64, whence: u32, newoffset_ptr: u32) -> u32 {
-        if self.is_fd_closed(fd) {
+        if !self.is_open_fd(fd) {
             return Errno::Badf as u32;
         }
 
@@ -703,9 +778,9 @@ impl WasiRuntime {
             _ => {}
         }
 
-        let (path, current_offset, _) = match self.descriptor_file_state(fd) {
+        let (path, current_offset, _) = match self.fd_file_state(fd) {
             Some(state) => state,
-            None if self.preopen_for_fd(fd).is_some() => return Errno::Inval as u32,
+            None if self.fd_dir_path(fd).is_some() => return Errno::Inval as u32,
             None => return Errno::Badf as u32,
         };
 
@@ -719,7 +794,7 @@ impl WasiRuntime {
             Err(errno) => return errno,
         };
 
-        if let Err(errno) = self.set_descriptor_file_offset(fd, new_offset) {
+        if let Err(errno) = self.set_fd_file_offset(fd, new_offset) {
             return errno;
         }
 
@@ -734,16 +809,39 @@ impl WasiRuntime {
         }
     }
 
+    pub fn fd_tell(&mut self, fd: u32, offset_ptr: u32) -> u32 {
+        if !self.is_open_fd(fd) {
+            return Errno::Badf as u32;
+        }
+
+        match fd {
+            0 | 1 | 2 => return Errno::Spipe as u32,
+            _ => {}
+        }
+
+        let (_, offset, _) = match self.fd_file_state(fd) {
+            Some(state) => state,
+            None if self.fd_dir_path(fd).is_some() => return Errno::Inval as u32,
+            None => return Errno::Badf as u32,
+        };
+
+        let offset_u64 = match u64::try_from(offset) {
+            Ok(value) => value,
+            Err(_) => return Errno::Inval as u32,
+        };
+
+        match self.memory.write_u64(offset_ptr, offset_u64) {
+            Ok(_) => Errno::Success as u32,
+            Err(_) => Errno::Inval as u32,
+        }
+    }
+
     pub fn fd_fdstat_get(&mut self, fd: u32, stat_ptr: u32) -> u32 {
         let all_rights: u64 = u64::MAX;
 
-        let file_type = match fd {
-            0 | 1 | 2 if !self.is_fd_closed(fd) => FileType::CharacterDevice,
-            _ if self.preopen_for_fd(fd).is_some() => FileType::Directory,
-            _ => match self.descriptor_file_type(fd) {
-                Some(file_type) => file_type,
-                None => return Errno::Badf as u32,
-            },
+        let file_type = match self.fd_file_type(fd) {
+            Some(file_type) => file_type,
+            None => return Errno::Badf as u32,
         };
 
         match self
@@ -756,15 +854,13 @@ impl WasiRuntime {
     }
 
     pub fn fd_filestat_get(&mut self, fd: u32, stat_ptr: u32) -> u32 {
-        if self.is_fd_closed(fd) {
-            return Errno::Badf as u32;
-        }
-
-        let (file_type, size) = match fd {
-            0 | 1 | 2 => (FileType::CharacterDevice, 0),
-            _ if self.preopen_for_fd(fd).is_some() => (FileType::Directory, 0),
-            _ => match self.descriptors.get(&fd) {
-                Some(Descriptor::Directory { path }) => {
+        let (file_type, size) = match self.fd_table.get(&fd) {
+            Some(FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr) => {
+                (FileType::CharacterDevice, 0)
+            }
+            Some(FdEntry::PreopenDirectory { .. }) => (FileType::Directory, 0),
+            Some(entry) => match entry {
+                FdEntry::Directory { path } => {
                     let size = match self.fs.entry_size(path) {
                         Ok(size) => size,
                         Err(_) => return Errno::Inval as u32,
@@ -772,7 +868,7 @@ impl WasiRuntime {
 
                     (FileType::Directory, size)
                 }
-                Some(Descriptor::File { path, .. }) => {
+                FdEntry::File { path, .. } => {
                     let size = match self.fs.entry_size(path) {
                         Ok(size) => size,
                         Err(_) => return Errno::Inval as u32,
@@ -780,8 +876,12 @@ impl WasiRuntime {
 
                     (FileType::RegularFile, size)
                 }
-                None => return Errno::Badf as u32,
+                FdEntry::Stdin
+                | FdEntry::Stdout
+                | FdEntry::Stderr
+                | FdEntry::PreopenDirectory { .. } => unreachable!(),
             },
+            None => return Errno::Badf as u32,
         };
 
         match self.memory.write_filestat(stat_ptr, file_type as u8, size) {
@@ -826,22 +926,24 @@ impl WasiRuntime {
     }
 
     pub fn fd_prestat_get(&mut self, fd: u32, prestat_ptr: u32) -> u32 {
-        match self.preopen_for_fd(fd) {
-            Some(path) => {
+        match self.fd_table.get(&fd) {
+            Some(FdEntry::PreopenDirectory { path }) => {
                 let name_len = path.len() as u32;
                 match self.memory.write_prestat_dir(prestat_ptr, name_len) {
                     Ok(_) => Errno::Success as u32,
                     Err(_) => Errno::Inval as u32,
                 }
             }
+            Some(_) => Errno::Badf as u32,
             None => Errno::Badf as u32,
         }
     }
 
     pub fn fd_prestat_dir_name(&mut self, fd: u32, path_ptr: u32, path_len: u32) -> u32 {
-        let path = match self.preopen_for_fd(fd) {
-            Some(p) => p.clone(),
+        let path = match self.fd_table.get(&fd) {
+            Some(FdEntry::PreopenDirectory { path }) => path.clone(),
             None => return Errno::Badf as u32,
+            Some(_) => return Errno::Badf as u32,
         };
 
         let bytes = path.as_bytes();
@@ -865,11 +967,39 @@ impl WasiRuntime {
             return Errno::Badf as u32;
         }
 
-        if self.descriptors.remove(&fd).is_none() {
-            self.closed_fds.insert(fd);
-        }
+        self.fd_table.remove(&fd);
 
         Errno::Success as u32
+    }
+
+    pub fn fd_renumber(&mut self, fd: u32, to: u32) -> u32 {
+        if !self.is_open_fd(fd) || !self.is_open_fd(to) {
+            return Errno::Badf as u32;
+        }
+
+        if fd == to {
+            return Errno::Success as u32;
+        }
+
+        let entry = match self.fd_table.remove(&fd) {
+            Some(entry) => entry,
+            None => return Errno::Badf as u32,
+        };
+
+        self.fd_table.insert(to, entry);
+        Errno::Success as u32
+    }
+
+    pub fn fd_sync(&mut self, fd: u32) -> u32 {
+        if self.is_open_fd(fd) {
+            Errno::Success as u32
+        } else {
+            Errno::Badf as u32
+        }
+    }
+
+    pub fn fd_datasync(&mut self, fd: u32) -> u32 {
+        self.fd_sync(fd)
     }
 
     // ==============================
@@ -1067,8 +1197,8 @@ impl WasiRuntime {
         let wants_truncate = oflags & OFLAGS_TRUNC != 0;
         let wants_append = fdflags & FDFLAGS_APPEND != 0;
 
-        let descriptor = match self.fs.kind(&path) {
-            Ok(Some(VfsEntryKind::Directory)) => Descriptor::Directory { path },
+        let entry = match self.fs.kind(&path) {
+            Ok(Some(VfsEntryKind::Directory)) => FdEntry::Directory { path },
             Ok(Some(VfsEntryKind::File)) if wants_directory => return Errno::Inval as u32,
             Ok(Some(VfsEntryKind::File)) => {
                 if wants_truncate && self.fs.truncate_file(&path).is_err() {
@@ -1084,7 +1214,7 @@ impl WasiRuntime {
                     0
                 };
 
-                Descriptor::File {
+                FdEntry::File {
                     path,
                     offset,
                     append: wants_append,
@@ -1094,7 +1224,7 @@ impl WasiRuntime {
                 if self.fs.create_file(&path).is_err() {
                     return Errno::Noent as u32;
                 }
-                Descriptor::File {
+                FdEntry::File {
                     path,
                     offset: 0,
                     append: wants_append,
@@ -1108,7 +1238,7 @@ impl WasiRuntime {
             return Errno::Inval as u32;
         }
 
-        let opened_fd = match self.alloc_fd(descriptor) {
+        let opened_fd = match self.alloc_fd(entry) {
             Ok(fd) => fd,
             Err(errno) => return errno,
         };
@@ -1116,7 +1246,7 @@ impl WasiRuntime {
         match self.memory.write_u32(opened_fd_ptr, opened_fd) {
             Ok(_) => Errno::Success as u32,
             Err(_) => {
-                self.descriptors.remove(&opened_fd);
+                self.fd_table.remove(&opened_fd);
                 Errno::Inval as u32
             }
         }
@@ -1137,6 +1267,58 @@ impl WasiRuntime {
         match self.fs.create_directory(&path) {
             Ok(_) => Errno::Success as u32,
             Err(_) => Errno::Noent as u32,
+        }
+    }
+
+    pub fn path_rename(
+        &mut self,
+        old_fd: u32,
+        old_path_ptr: u32,
+        old_path_len: u32,
+        new_fd: u32,
+        new_path_ptr: u32,
+        new_path_len: u32,
+    ) -> u32 {
+        let old_path = match self.resolve_path(old_fd, old_path_ptr, old_path_len) {
+            Ok(path) => path,
+            Err(errno) => return errno,
+        };
+
+        let new_path = match self.resolve_path(new_fd, new_path_ptr, new_path_len) {
+            Ok(path) => path,
+            Err(errno) => return errno,
+        };
+
+        match self.fs.kind(&old_path) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Errno::Noent as u32,
+            Err(_) => return Errno::Inval as u32,
+        }
+
+        match self.fs.rename(&old_path, &new_path) {
+            Ok(_) => Errno::Success as u32,
+            Err(_) => Errno::Inval as u32,
+        }
+    }
+
+    pub fn path_readlink(
+        &mut self,
+        dirfd: u32,
+        path_ptr: u32,
+        path_len: u32,
+        _buf_ptr: u32,
+        _buf_len: u32,
+        _bufused_ptr: u32,
+    ) -> u32 {
+        let path = match self.resolve_path(dirfd, path_ptr, path_len) {
+            Ok(path) => path,
+            Err(errno) => return errno,
+        };
+
+        match self.fs.kind(&path) {
+            Ok(Some(_)) => Errno::Inval as u32,
+            Ok(None) => Errno::Noent as u32,
+            Err(_) => Errno::Inval as u32,
         }
     }
 
@@ -1195,7 +1377,9 @@ impl WasiRuntime {
     // Fallback
     // ==============================
 
-    pub fn stub(&self, name: &str) -> u32 {
+    pub fn stub(&mut self, name: &str) -> u32 {
+        self.record_missing_syscall(name);
+
         #[cfg(target_arch = "wasm32")]
         web_sys::console::warn_1(&format!("unimplemented syscall: {}", name).into());
 
@@ -1300,6 +1484,125 @@ mod tests {
         assert_eq!(runtime.fd_close(fd), Errno::Success as u32);
         assert_eq!(runtime.fd_fdstat_get(fd, 64), Errno::Badf as u32);
         assert_eq!(runtime.fd_close(fd), Errno::Badf as u32);
+    }
+
+    #[test]
+    fn fd_renumber_moves_descriptor_and_closes_target() {
+        let mut runtime = WasiRuntime::new(512);
+
+        write_str(&mut runtime, 0, "a.txt");
+        assert_eq!(
+            runtime.path_open(3, 0, 0, 5, OFLAGS_CREAT, 0, 0, 0, 32),
+            Errno::Success as u32
+        );
+        let a_fd = read_u32(&runtime, 32);
+
+        write_str(&mut runtime, 16, "b.txt");
+        assert_eq!(
+            runtime.path_open(3, 0, 16, 5, OFLAGS_CREAT, 0, 0, 0, 36),
+            Errno::Success as u32
+        );
+        let b_fd = read_u32(&runtime, 36);
+
+        write_str(&mut runtime, 64, "hello");
+        runtime.memory.write_u32(48, 64).unwrap();
+        runtime.memory.write_u32(52, 5).unwrap();
+        assert_eq!(runtime.fd_write(a_fd, 48, 1, 40), Errno::Success as u32);
+
+        assert_eq!(runtime.fd_renumber(a_fd, b_fd), Errno::Success as u32);
+        assert_eq!(runtime.fd_fdstat_get(a_fd, 80), Errno::Badf as u32);
+        assert_eq!(runtime.fd_tell(b_fd, 88), Errno::Success as u32);
+        assert_eq!(read_u64(&runtime, 88), 5);
+
+        write_str(&mut runtime, 96, "!");
+        runtime.memory.write_u32(112, 96).unwrap();
+        runtime.memory.write_u32(116, 1).unwrap();
+        assert_eq!(runtime.fd_write(b_fd, 112, 1, 120), Errno::Success as u32);
+
+        write_str(&mut runtime, 128, "a.txt");
+        assert_eq!(
+            runtime.path_open(3, 0, 128, 5, 0, 0, 0, 0, 136),
+            Errno::Success as u32
+        );
+        let read_fd = read_u32(&runtime, 136);
+
+        runtime.memory.write_u32(144, 176).unwrap();
+        runtime.memory.write_u32(148, 6).unwrap();
+        assert_eq!(runtime.fd_read(read_fd, 144, 1, 152), Errno::Success as u32);
+        assert_eq!(read_u32(&runtime, 152), 6);
+        assert_eq!(runtime.memory.slice(176, 6).unwrap(), b"hello!");
+    }
+
+    #[test]
+    fn fd_renumber_rejects_invalid_source_or_target_and_allows_same_fd() {
+        let mut runtime = WasiRuntime::new(128);
+
+        write_str(&mut runtime, 0, "note.txt");
+        assert_eq!(
+            runtime.path_open(3, 0, 0, 8, OFLAGS_CREAT, 0, 0, 0, 32),
+            Errno::Success as u32
+        );
+        let fd = read_u32(&runtime, 32);
+
+        assert_eq!(runtime.fd_renumber(fd, fd), Errno::Success as u32);
+        assert_eq!(runtime.fd_renumber(999, fd), Errno::Badf as u32);
+        assert_eq!(runtime.fd_renumber(fd, 999), Errno::Badf as u32);
+    }
+
+    #[test]
+    fn set_stdin_replaces_buffered_input_between_runs() {
+        let mut runtime = WasiRuntime::new(128);
+
+        runtime.feed_stdin(b"old");
+        runtime.set_stdin(b"new");
+
+        runtime.memory.write_u32(0, 32).unwrap();
+        runtime.memory.write_u32(4, 8).unwrap();
+        assert_eq!(runtime.fd_read(0, 0, 1, 16), Errno::Success as u32);
+
+        assert_eq!(read_u32(&runtime, 16), 3);
+        assert_eq!(runtime.memory.slice(32, 3).unwrap(), b"new");
+    }
+
+    #[test]
+    fn fd_sync_and_fd_datasync_validate_descriptors() {
+        let mut runtime = WasiRuntime::new(256);
+
+        assert_eq!(runtime.fd_sync(1), Errno::Success as u32);
+        assert_eq!(runtime.fd_datasync(3), Errno::Success as u32);
+
+        write_str(&mut runtime, 0, "note.txt");
+        assert_eq!(
+            runtime.path_open(3, 0, 0, 8, OFLAGS_CREAT, 0, 0, 0, 32),
+            Errno::Success as u32
+        );
+        let fd = read_u32(&runtime, 32);
+        assert_eq!(runtime.fd_sync(fd), Errno::Success as u32);
+        assert_eq!(runtime.fd_datasync(fd), Errno::Success as u32);
+
+        assert_eq!(runtime.fd_close(fd), Errno::Success as u32);
+        assert_eq!(runtime.fd_sync(fd), Errno::Badf as u32);
+        assert_eq!(runtime.fd_datasync(999), Errno::Badf as u32);
+    }
+
+    #[test]
+    fn stub_records_unique_missing_syscalls() {
+        let mut runtime = WasiRuntime::new(64);
+
+        assert_eq!(runtime.stub("poll_oneoff"), Errno::Nosys as u32);
+        assert_eq!(runtime.stub("poll_oneoff"), Errno::Nosys as u32);
+        assert_eq!(runtime.stub("sock_accept"), Errno::Nosys as u32);
+
+        assert_eq!(
+            runtime.missing_syscalls(),
+            vec!["poll_oneoff".to_string(), "sock_accept".to_string()]
+        );
+
+        assert_eq!(
+            runtime.take_missing_syscalls(),
+            vec!["poll_oneoff".to_string(), "sock_accept".to_string()]
+        );
+        assert!(runtime.missing_syscalls().is_empty());
     }
 
     #[test]
@@ -1661,6 +1964,50 @@ mod tests {
     }
 
     #[test]
+    fn fd_tell_reports_current_file_descriptor_offset() {
+        let mut runtime = WasiRuntime::new(512);
+
+        write_str(&mut runtime, 0, "note.txt");
+        assert_eq!(
+            runtime.path_open(3, 0, 0, 8, OFLAGS_CREAT, 0, 0, 0, 32),
+            Errno::Success as u32
+        );
+        let fd = read_u32(&runtime, 32);
+
+        write_str(&mut runtime, 64, "abcdef");
+        runtime.memory.write_u32(48, 64).unwrap();
+        runtime.memory.write_u32(52, 6).unwrap();
+        assert_eq!(runtime.fd_write(fd, 48, 1, 40), Errno::Success as u32);
+
+        assert_eq!(runtime.fd_tell(fd, 80), Errno::Success as u32);
+        assert_eq!(read_u64(&runtime, 80), 6);
+
+        assert_eq!(
+            runtime.fd_seek(fd, 2, WHENCE_SET, 88),
+            Errno::Success as u32
+        );
+        assert_eq!(runtime.fd_tell(fd, 96), Errno::Success as u32);
+        assert_eq!(read_u64(&runtime, 96), 2);
+    }
+
+    #[test]
+    fn fd_tell_rejects_streams_directories_bad_descriptors_and_invalid_memory() {
+        let mut runtime = WasiRuntime::new(64);
+
+        assert_eq!(runtime.fd_tell(0, 0), Errno::Spipe as u32);
+        assert_eq!(runtime.fd_tell(3, 0), Errno::Inval as u32);
+        assert_eq!(runtime.fd_tell(999, 0), Errno::Badf as u32);
+
+        write_str(&mut runtime, 0, "note.txt");
+        assert_eq!(
+            runtime.path_open(3, 0, 0, 8, OFLAGS_CREAT, 0, 0, 0, 32),
+            Errno::Success as u32
+        );
+        let fd = read_u32(&runtime, 32);
+        assert_eq!(runtime.fd_tell(fd, 60), Errno::Inval as u32);
+    }
+
+    #[test]
     fn path_open_with_truncate_clears_existing_file() {
         let mut runtime = WasiRuntime::new(512);
 
@@ -1737,5 +2084,170 @@ mod tests {
         assert_eq!(runtime.fd_read(read_fd, 128, 1, 136), Errno::Success as u32);
         assert_eq!(read_u32(&runtime, 136), 6);
         assert_eq!(runtime.memory.slice(160, 6).unwrap(), b"hello!");
+    }
+
+    #[test]
+    fn path_rename_moves_file_between_directories() {
+        let mut runtime = WasiRuntime::new(512);
+
+        write_str(&mut runtime, 0, "tmp");
+        assert_eq!(
+            runtime.path_create_directory(3, 0, 3),
+            Errno::Success as u32
+        );
+        write_str(&mut runtime, 16, "tmp/archive");
+        assert_eq!(
+            runtime.path_create_directory(3, 16, 11),
+            Errno::Success as u32
+        );
+
+        write_str(&mut runtime, 32, "tmp/note.txt");
+        assert_eq!(
+            runtime.path_open(3, 0, 32, 12, OFLAGS_CREAT, 0, 0, 0, 80),
+            Errno::Success as u32
+        );
+        let fd = read_u32(&runtime, 80);
+
+        write_str(&mut runtime, 96, "hello");
+        runtime.memory.write_u32(88, 96).unwrap();
+        runtime.memory.write_u32(92, 5).unwrap();
+        assert_eq!(runtime.fd_write(fd, 88, 1, 84), Errno::Success as u32);
+
+        write_str(&mut runtime, 112, "tmp/archive/final.txt");
+        assert_eq!(
+            runtime.path_rename(3, 32, 12, 3, 112, 21),
+            Errno::Success as u32
+        );
+        assert_eq!(
+            runtime.path_filestat_get(3, 0, 32, 12, 160),
+            Errno::Noent as u32
+        );
+        assert_eq!(
+            runtime.path_filestat_get(3, 0, 112, 21, 160),
+            Errno::Success as u32
+        );
+    }
+
+    #[test]
+    fn path_rename_rejects_missing_source_and_existing_destination() {
+        let mut runtime = WasiRuntime::new(512);
+
+        write_str(&mut runtime, 0, "a.txt");
+        write_str(&mut runtime, 16, "b.txt");
+        assert_eq!(
+            runtime.path_open(3, 0, 0, 5, OFLAGS_CREAT, 0, 0, 0, 64),
+            Errno::Success as u32
+        );
+        assert_eq!(
+            runtime.path_open(3, 0, 16, 5, OFLAGS_CREAT, 0, 0, 0, 68),
+            Errno::Success as u32
+        );
+
+        write_str(&mut runtime, 32, "missing.txt");
+        assert_eq!(
+            runtime.path_rename(3, 32, 11, 3, 16, 5),
+            Errno::Noent as u32
+        );
+        assert_eq!(runtime.path_rename(3, 0, 5, 3, 16, 5), Errno::Inval as u32);
+    }
+
+    #[test]
+    fn path_readlink_reports_clear_no_symlink_stance() {
+        let mut runtime = WasiRuntime::new(512);
+
+        write_str(&mut runtime, 0, "note.txt");
+        assert_eq!(
+            runtime.path_open(3, 0, 0, 8, OFLAGS_CREAT, 0, 0, 0, 32),
+            Errno::Success as u32
+        );
+        assert_eq!(
+            runtime.path_readlink(3, 0, 8, 64, 32, 48),
+            Errno::Inval as u32
+        );
+
+        write_str(&mut runtime, 80, "tmp");
+        assert_eq!(
+            runtime.path_create_directory(3, 80, 3),
+            Errno::Success as u32
+        );
+        assert_eq!(
+            runtime.path_readlink(3, 80, 3, 64, 32, 48),
+            Errno::Inval as u32
+        );
+    }
+
+    #[test]
+    fn path_readlink_rejects_missing_paths_bad_dirfd_and_invalid_paths() {
+        let mut runtime = WasiRuntime::new(512);
+
+        write_str(&mut runtime, 0, "missing");
+        assert_eq!(
+            runtime.path_readlink(3, 0, 7, 64, 32, 48),
+            Errno::Noent as u32
+        );
+
+        assert_eq!(
+            runtime.path_readlink(999, 0, 7, 64, 32, 48),
+            Errno::Badf as u32
+        );
+
+        write_str(&mut runtime, 16, "../escape");
+        assert_eq!(
+            runtime.path_readlink(3, 16, 9, 64, 32, 48),
+            Errno::Inval as u32
+        );
+    }
+
+    #[test]
+    fn workspace_api_reads_writes_lists_renames_and_removes_entries() {
+        let mut runtime = WasiRuntime::new(512);
+
+        runtime.workspace_create_directory("/workspace").unwrap();
+        runtime
+            .workspace_write_file("/workspace/note.txt", b"hello workspace")
+            .unwrap();
+
+        assert_eq!(
+            runtime.workspace_read_file("/workspace/note.txt").unwrap(),
+            b"hello workspace"
+        );
+        assert_eq!(
+            runtime.workspace_read_dir("/workspace").unwrap(),
+            vec!["note.txt"]
+        );
+        assert_eq!(
+            runtime.workspace_entry_type("/workspace/note.txt").unwrap(),
+            Some("file".to_string())
+        );
+        assert_eq!(
+            runtime.workspace_entry_size("/workspace/note.txt").unwrap(),
+            15
+        );
+
+        runtime
+            .workspace_rename("/workspace/note.txt", "/workspace/final.txt")
+            .unwrap();
+        assert_eq!(
+            runtime.workspace_read_dir("/workspace").unwrap(),
+            vec!["final.txt"]
+        );
+
+        runtime
+            .workspace_remove_file("/workspace/final.txt")
+            .unwrap();
+        runtime.workspace_remove_directory("/workspace").unwrap();
+        assert_eq!(runtime.workspace_entry_type("/workspace").unwrap(), None);
+    }
+
+    #[test]
+    fn workspace_write_replaces_existing_file_contents() {
+        let mut runtime = WasiRuntime::new(512);
+
+        runtime
+            .workspace_write_file("/note.txt", b"longer")
+            .unwrap();
+        runtime.workspace_write_file("/note.txt", b"tiny").unwrap();
+
+        assert_eq!(runtime.workspace_read_file("/note.txt").unwrap(), b"tiny");
     }
 }

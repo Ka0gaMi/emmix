@@ -23,8 +23,10 @@ const expectedStdout = [
   "args=fixture,one,two words",
   "env=present",
   "stdin=input from smoke",
-  "file=present|input from smoke",
-  "entries=message.txt",
+  "file_prefix=present|input from smoke",
+  "file_len=506",
+  "file_pos=7",
+  "entries=final.txt",
   "",
 ].join("\n");
 

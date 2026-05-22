@@ -44,7 +44,10 @@ const server = createServer(async (req, res) => {
   }
 
   const ct = MIME[extname(target).toLowerCase()] ?? 'application/octet-stream';
-  res.writeHead(200, { 'Content-Type': ct });
+  res.writeHead(200, {
+    'Content-Type': ct,
+    'Cache-Control': 'no-store',
+  });
   res.end(data);
 });
 

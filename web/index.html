@@ -102,12 +102,61 @@
     /* ── Terminal container ───────────────────────────── */
     #terminal-wrap {
       flex: 1;
-      overflow: hidden;
-      padding: 6px 6px 6px 8px;
+      overflow: auto;
+      padding: 14px 16px;
+      min-width: 0;
+      min-height: 0;
+      color: #c9d1d9;
+      background: #0d1117;
+      font-size: 14px;
+      line-height: 1.55;
+      cursor: text;
     }
 
-    .xterm { height: 100%; }
-    .xterm-viewport { overflow-y: auto !important; }
+    .terminal-output {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .terminal-input-row {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .terminal-prompt {
+      flex: 0 0 auto;
+      white-space: nowrap;
+    }
+
+    .terminal-input {
+      flex: 1 1 auto;
+      min-width: 8ch;
+      border: 0;
+      outline: 0;
+      padding: 0;
+      color: #c9d1d9;
+      background: transparent;
+      font: inherit;
+      line-height: inherit;
+    }
+
+    .terminal-input:disabled {
+      opacity: .6;
+    }
+
+    .banner { color: #58a6ff; font-weight: 700; letter-spacing: .16em; }
+    .title { color: #f0f6fc; font-weight: 700; }
+    .muted { color: #8b949e; }
+    .green, .success { color: #3fb950; }
+    .blue { color: #58a6ff; }
+    .warning { color: #d29922; }
+    .error { color: #ff7b72; }
+    .command-gap {
+      display: inline-block;
+      width: 28px;
+    }
 
     /* ── Drop overlay ─────────────────────────────────── */
     #drop-overlay {

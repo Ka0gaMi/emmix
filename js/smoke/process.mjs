@@ -4,7 +4,14 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
-import { EmmixProcess } from "../process-node.js";
+import {
+  EmmixProcess,
+  EmmixWorkspaceConflictError,
+} from "../process-node.js";
+import {
+  detectRuntimeCapabilities,
+  recommendProcessStrategy,
+} from "../capabilities.js";
 
 const runCommand = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -64,8 +71,58 @@ const persistWriteBytes = await readFile(persistWriteWasm);
 const persistReadBytes = await readFile(persistReadWasm);
 
 const process = new EmmixProcess({ runtimeWasm });
+const observedEvents = [];
+const unsubscribeEvents = process.events.subscribe((event) => {
+  observedEvents.push(event);
+});
 
 try {
+  if (!process.audit.export().some((event) => event.type === "runtime:boot")) {
+    throw new Error("expected audit log to include runtime:boot");
+  }
+
+  if (process.capabilities.environment !== "node") {
+    throw new Error(`expected node capabilities, got ${process.capabilities.environment}`);
+  }
+  if (process.capabilities.recommendedProcessStrategy !== "node-worker") {
+    throw new Error(`expected node-worker strategy, got ${process.capabilities.recommendedProcessStrategy}`);
+  }
+  if (!process.capabilities.features.nodeWorkerThreads) {
+    throw new Error("expected node worker thread capability");
+  }
+
+  const syntheticBrowserCapabilities = detectRuntimeCapabilities({
+    environment: "browser",
+    moduleWorker: true,
+    globalThis: {
+      WebAssembly,
+      Worker: function Worker() {},
+      SharedWorker: function SharedWorker() {},
+      SharedArrayBuffer,
+      Atomics,
+      crossOriginIsolated: true,
+    },
+  });
+  if (syntheticBrowserCapabilities.recommendedProcessStrategy !== "module-worker") {
+    throw new Error(`expected synthetic browser module-worker strategy, got ${syntheticBrowserCapabilities.recommendedProcessStrategy}`);
+  }
+  if (!syntheticBrowserCapabilities.blocking) {
+    throw new Error("expected synthetic browser SAB blocking capability");
+  }
+  if (recommendProcessStrategy({
+    webAssembly: true,
+    wasmCompileStreaming: true,
+    classicWorker: true,
+    moduleWorker: false,
+    sharedWorker: false,
+    sharedArrayBuffer: false,
+    atomicsWait: false,
+    crossOriginIsolated: false,
+    nodeWorkerThreads: false,
+  }) !== "classic-worker") {
+    throw new Error("expected classic-worker fallback strategy");
+  }
+
   await process.workspace.mkdir("/workspace");
   await process.workspace.writeText("/workspace/note.txt", "worker workspace\n");
   await process.workspace.rename("/workspace/note.txt", "/workspace/final.txt");
@@ -83,6 +140,127 @@ try {
   const workspaceStat = await process.workspace.stat("/workspace/final.txt");
   if (workspaceStat?.type !== "file" || workspaceStat.size !== 17) {
     throw new Error(`expected process workspace stat, got ${JSON.stringify(workspaceStat)}`);
+  }
+
+  const transaction = process.workspace.beginTransaction();
+  await transaction.writeText("/workspace/transaction.txt", "transaction commit");
+  const transactionResult = await transaction.commit();
+  if (!transactionResult.changes.some((change) => change.path === "/workspace/transaction.txt")) {
+    throw new Error(`expected transaction commit change, got ${JSON.stringify(transactionResult.changes)}`);
+  }
+  const transactionText = await process.workspace.readText("/workspace/transaction.txt");
+  if (transactionText !== "transaction commit") {
+    throw new Error(`expected transaction file, got ${JSON.stringify(transactionText)}`);
+  }
+
+  const rolledBack = process.workspace.beginTransaction();
+  await rolledBack.writeText("/workspace/rolled-back.txt", "nope");
+  rolledBack.rollback();
+  const rolledBackStat = await process.workspace.stat("/workspace/rolled-back.txt");
+  if (rolledBackStat !== undefined) {
+    throw new Error(`expected rolled-back file to be absent, got ${JSON.stringify(rolledBackStat)}`);
+  }
+
+  await process.workspace.writeText("/workspace/conflict.txt", "base");
+  const conflictTransaction = process.workspace.beginTransaction();
+  await conflictTransaction.writeText("/workspace/conflict.txt", "incoming");
+  await process.workspace.writeText("/workspace/conflict.txt", "current");
+  await conflictTransaction.commit().then(
+    () => {
+      throw new Error("expected transaction conflict");
+    },
+    (error) => {
+      if (!(error instanceof EmmixWorkspaceConflictError)) {
+        throw error;
+      }
+      const [conflict] = error.conflicts;
+      if (
+        conflict?.path !== "/workspace/conflict.txt" ||
+        new TextDecoder().decode(conflict.current?.bytes) !== "current" ||
+        new TextDecoder().decode(conflict.incoming?.bytes) !== "incoming"
+      ) {
+        throw new Error(`unexpected conflict payload: ${JSON.stringify(error.conflicts)}`);
+      }
+    },
+  );
+
+  const overwriteTransaction = process.workspace.beginTransaction();
+  await overwriteTransaction.writeText("/workspace/conflict.txt", "incoming-lww");
+  await process.workspace.writeText("/workspace/conflict.txt", "current-lww");
+  const overwriteResult = await overwriteTransaction.commit({ conflict: "last-write-wins" });
+  if (overwriteResult.conflicts.length !== 1) {
+    throw new Error(`expected last-write-wins conflict metadata, got ${JSON.stringify(overwriteResult.conflicts)}`);
+  }
+  const overwriteText = await process.workspace.readText("/workspace/conflict.txt");
+  if (overwriteText !== "incoming-lww") {
+    throw new Error(`expected last-write-wins text, got ${JSON.stringify(overwriteText)}`);
+  }
+
+  if (!observedEvents.some((event) => event.type === "workspace:conflict")) {
+    throw new Error("expected observed workspace:conflict event");
+  }
+  if (!process.audit.export({ type: "workspace:write" }).some((event) =>
+    event.detail.path === "/workspace/conflict.txt" && event.detail.byteLength === 12
+  )) {
+    throw new Error("expected workspace write audit event with byte length metadata");
+  }
+
+  if (process.shell.pwd() !== "/") {
+    throw new Error(`expected initial shell cwd /, got ${process.shell.pwd()}`);
+  }
+
+  await process.shell.cd("/workspace");
+  if (process.shell.pwd() !== "/workspace") {
+    throw new Error(`expected shell cwd /workspace, got ${process.shell.pwd()}`);
+  }
+
+  await process.shell.writeText("relative.txt", "relative shell workspace\n");
+  const relativeText = await process.workspace.readText("/workspace/relative.txt");
+  if (relativeText !== "relative shell workspace\n") {
+    throw new Error(`expected shell relative write, got ${JSON.stringify(relativeText)}`);
+  }
+
+  process.shell.setEnv("EMMIX_FIXTURE", "present");
+  process.shell.setEnv("SHELL_MARKER", "session");
+  process.shell.unsetEnv("SHELL_MARKER");
+  const commandOptions = process.shell.commandOptions({
+    args: ["fixture", "one", "two words"],
+  });
+  if (!commandOptions.environ.includes("PWD=/workspace")) {
+    throw new Error(`expected command environ to include PWD, got ${JSON.stringify(commandOptions.environ)}`);
+  }
+  if (!commandOptions.environ.includes("EMMIX_FIXTURE=present")) {
+    throw new Error(`expected command environ to include shell env, got ${JSON.stringify(commandOptions.environ)}`);
+  }
+  if (commandOptions.environ.some((entry) => entry.startsWith("SHELL_MARKER="))) {
+    throw new Error(`expected unset env to be removed, got ${JSON.stringify(commandOptions.environ)}`);
+  }
+
+  const commandNames = process.commands.list().map((command) => command.name);
+  for (const name of ["cat", "cd", "ls", "mkdir", "pwd", "write"]) {
+    if (!commandNames.includes(name)) {
+      throw new Error(`expected default command registry to include ${name}`);
+    }
+  }
+
+  await process.commands.execute(["mkdir", "registry"]);
+  await process.commands.execute(["write", "registry/note.txt", "hello registry"]);
+  const registryCat = await process.commands.execute(["cat", "registry/note.txt"]);
+  const registryText = new TextDecoder().decode(registryCat.stdout);
+  if (registryText !== "hello registry") {
+    throw new Error(`expected registry cat output, got ${JSON.stringify(registryText)}`);
+  }
+
+  await process.commands.execute(["cd", "registry"]);
+  const registryPwd = new TextDecoder().decode((await process.commands.execute(["pwd"])).stdout);
+  if (registryPwd !== "/workspace/registry\n") {
+    throw new Error(`expected registry pwd output, got ${JSON.stringify(registryPwd)}`);
+  }
+  await process.commands.execute(["cd", "/workspace"]);
+
+  const missingCommand = await process.commands.execute(["does-not-exist"]);
+  if (missingCommand.exitCode !== 127) {
+    throw new Error(`expected missing command exit 127, got ${missingCommand.exitCode}`);
   }
 
   const stdoutChunks = [];
@@ -136,6 +314,20 @@ try {
     throw new Error(`expected no missing syscalls, got ${JSON.stringify(result.missingSyscalls)}`);
   }
 
+  if (!observedEvents.some((event) => event.type === "process:spawn" && event.detail.pid === spawned.pid)) {
+    throw new Error("expected process:spawn event for spawned process");
+  }
+  if (!observedEvents.some((event) => event.type === "process:stdout" && event.detail.pid === spawned.pid)) {
+    throw new Error("expected process:stdout event for spawned process");
+  }
+  if (!observedEvents.some((event) =>
+    event.type === "process:exit" &&
+    event.detail.pid === spawned.pid &&
+    event.detail.exitCode === 0
+  )) {
+    throw new Error("expected process:exit event for spawned process");
+  }
+
   const persistWrite = await process.exec(persistWriteBytes);
   if (persistWrite.exitCode !== 0) {
     throw new Error(`expected persist writer exit code 0, got ${persistWrite.exitCode}`);
@@ -145,6 +337,105 @@ try {
   const persistStdout = new TextDecoder().decode(persistRead.stdout);
   if (persistStdout !== "persist=kept\n") {
     throw new Error(`expected persistent workspace file, got ${JSON.stringify(persistStdout)}`);
+  }
+
+  process.commands.registerWasi("persist-read", persistReadBytes, {}, {
+    description: "Read the persistence smoke fixture",
+  });
+  const registeredPersistRead = await process.commands.execute(["persist-read"]);
+  const registeredPersistStdout = new TextDecoder().decode(registeredPersistRead.stdout);
+  if (registeredPersistStdout !== "persist=kept\n") {
+    throw new Error(`expected registered WASI command stdout, got ${JSON.stringify(registeredPersistStdout)}`);
+  }
+
+  process.packages.addPackage({
+    name: "persist-tools",
+    version: "1.0.0",
+    commands: [
+      {
+        name: "pkg-persist-read",
+        wasmBytes: persistReadBytes,
+        description: "Read persistent smoke state",
+      },
+    ],
+  });
+  process.packages.addPackage({
+    name: "persist-tools",
+    version: "1.1.0",
+    commands: [],
+  });
+
+  const latestPersistTools = await process.packages.resolve("persist-tools");
+  if (latestPersistTools.version !== "1.1.0") {
+    throw new Error(`expected latest package version 1.1.0, got ${latestPersistTools.version}`);
+  }
+
+  const installedPackage = await process.packages.install("persist-tools@1.0.0", process.commands);
+  if (installedPackage.commands.length !== 1 || !process.commands.has("pkg-persist-read")) {
+    throw new Error("expected package install to register pkg-persist-read command");
+  }
+
+  const packageCommand = await process.commands.execute(["pkg-persist-read"]);
+  const packageCommandStdout = new TextDecoder().decode(packageCommand.stdout);
+  if (packageCommandStdout !== "persist=kept\n") {
+    throw new Error(`expected package command stdout, got ${JSON.stringify(packageCommandStdout)}`);
+  }
+
+  const queuedFirst = process.spawn(persistReadBytes);
+  const queuedSecond = process.spawn(persistReadBytes);
+  if (queuedFirst.status !== "running") {
+    throw new Error(`expected first queued test process to run, got ${queuedFirst.status}`);
+  }
+  if (queuedSecond.status !== "queued") {
+    throw new Error(`expected second queued test process to be queued, got ${queuedSecond.status}`);
+  }
+
+  const queuedFirstResult = await process.wait(queuedFirst.pid);
+  const queuedSecondResult = await process.wait(queuedSecond.pid);
+  const queuedFirstStdout = new TextDecoder().decode(queuedFirstResult.stdout);
+  const queuedSecondStdout = new TextDecoder().decode(queuedSecondResult.stdout);
+  if (queuedFirstStdout !== "persist=kept\n" || queuedSecondStdout !== "persist=kept\n") {
+    throw new Error(`expected queued process stdout, got ${JSON.stringify([queuedFirstStdout, queuedSecondStdout])}`);
+  }
+  if (queuedSecond.status !== "exited") {
+    throw new Error(`expected queued process to exit, got ${queuedSecond.status}`);
+  }
+
+  await process.wait(999999).then(
+    () => {
+      throw new Error("expected unknown process wait to fail");
+    },
+    (error) => {
+      if (!error.message.includes("unknown process")) {
+        throw error;
+      }
+    },
+  );
+
+  await process.packages.resolve("missing-package").then(
+    () => {
+      throw new Error("expected missing offline package to fail");
+    },
+    (error) => {
+      if (!error.message.includes("local package cache")) {
+        throw error;
+      }
+    },
+  );
+
+  const timedOut = process.spawn(createSpinModule(), { timeoutMs: 25 });
+  await timedOut.result.then(
+    () => {
+      throw new Error("expected spinning process to time out");
+    },
+    (error) => {
+      if (error.message !== "process timed out") {
+        throw error;
+      }
+    },
+  );
+  if (timedOut.status !== "cancelled") {
+    throw new Error(`expected timed out process to be cancelled, got ${timedOut.status}`);
   }
 
   const spinning = process.spawn(createSpinModule());
@@ -174,7 +465,55 @@ try {
 
   console.log("process worker smoke passed");
 } finally {
+  unsubscribeEvents();
   process.terminate();
+}
+
+const pool = new EmmixProcess({ runtimeWasm, maxProcesses: 2 });
+try {
+  await pool.workspace.writeText("/persist.txt", "pool");
+  const sharedFirst = pool.spawn(persistReadBytes);
+  const sharedSecond = pool.spawn(persistReadBytes);
+  if (sharedFirst.status !== "running" || sharedSecond.status !== "running") {
+    throw new Error(`expected shared snapshot processes to run, got ${sharedFirst.status}/${sharedSecond.status}`);
+  }
+  const sharedFirstStdout = new TextDecoder().decode((await sharedFirst.result).stdout);
+  const sharedSecondStdout = new TextDecoder().decode((await sharedSecond.result).stdout);
+  if (sharedFirstStdout !== "persist=pool\n" || sharedSecondStdout !== "persist=pool\n") {
+    throw new Error(`expected shared snapshot stdout, got ${JSON.stringify([sharedFirstStdout, sharedSecondStdout])}`);
+  }
+
+  await pool.workspace.writeText("/persist.txt", "before-secondary");
+  const secondaryRead = pool.spawn(persistReadBytes);
+  const secondaryWrite = pool.spawn(persistWriteBytes);
+  await Promise.all([secondaryRead.result, secondaryWrite.result]);
+  const mergedPersistText = await pool.workspace.readText("/persist.txt");
+  if (mergedPersistText !== "kept") {
+    throw new Error(`expected secondary worker write to merge, got ${JSON.stringify(mergedPersistText)}`);
+  }
+
+  const first = pool.spawn(createSpinModule());
+  const second = pool.spawn(createSpinModule());
+  const third = pool.spawn(createSpinModule());
+
+  if (first.status !== "running" || second.status !== "running") {
+    throw new Error(`expected first two pool processes to run, got ${first.status}/${second.status}`);
+  }
+  if (third.status !== "queued") {
+    throw new Error(`expected third pool process to queue, got ${third.status}`);
+  }
+
+  pool.cancel();
+
+  await Promise.allSettled([first.result, second.result, third.result]).then((results) => {
+    for (const result of results) {
+      if (result.status !== "rejected" || result.reason.message !== "process cancelled") {
+        throw new Error(`expected pool process cancellation, got ${JSON.stringify(results)}`);
+      }
+    }
+  });
+} finally {
+  pool.terminate();
 }
 
 function joinChunks(chunks) {
